@@ -10,6 +10,9 @@
 #include <mln/util/constants.hpp>
 #include <mln/util/instrumentation.hpp>
 #include <mln/util/logging.hpp>
+#if defined(OHOS_PLATFORM)
+#include <mln/util/native_resource_diagnostics.hpp>
+#endif
 #include <mln/util/tile_coordinate.hpp>
 #include <mln/util/tile_cover.hpp>
 
@@ -28,9 +31,17 @@ void ImageSourceRenderData::upload(gfx::UploadPass& uploadPass) const {
 }
 
 RenderImageSource::RenderImageSource(Immutable<style::ImageSource::Impl> impl_)
-    : RenderSource(std::move(impl_)) {}
+    : RenderSource(std::move(impl_)) {
+#if defined(OHOS_PLATFORM)
+    ohos::retainNativeImageResource(ohos::NativeImageResource::RenderImageSource);
+#endif
+}
 
-RenderImageSource::~RenderImageSource() = default;
+RenderImageSource::~RenderImageSource() {
+#if defined(OHOS_PLATFORM)
+    ohos::releaseNativeImageResource(ohos::NativeImageResource::RenderImageSource);
+#endif
+}
 
 const style::ImageSource::Impl& RenderImageSource::impl() const {
     return static_cast<const style::ImageSource::Impl&>(*baseImpl);

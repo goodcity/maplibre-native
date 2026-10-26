@@ -1,4 +1,7 @@
 #include <mln/renderer/renderer_impl.hpp>
+#if defined(OHOS_PLATFORM)
+#include <mln/util/native_resource_diagnostics.hpp>
+#endif
 
 #include <mln/geometry/line_atlas.hpp>
 #include <mln/gfx/backend_scope.hpp>
@@ -57,10 +60,17 @@ Renderer::Impl::Impl(gfx::RendererBackend& backend_,
     : orchestrator(!backend_.contextIsShared(), backend_.getThreadPool(), localFontFamily_),
       backend(backend_),
       observer(&nullObserver()),
-      pixelRatio(pixelRatio_) {}
+      pixelRatio(pixelRatio_) {
+#if defined(OHOS_PLATFORM)
+    ohos::retainNativeImageResource(ohos::NativeImageResource::RendererImpl);
+#endif
+}
 
 Renderer::Impl::~Impl() {
     assert(gfx::BackendScope::exists());
+#if defined(OHOS_PLATFORM)
+    ohos::releaseNativeImageResource(ohos::NativeImageResource::RendererImpl);
+#endif
 };
 
 void Renderer::Impl::onPreCompileShader(shaders::BuiltIn shaderID,

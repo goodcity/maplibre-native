@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <string>
+#include <stdexcept>
 
 namespace mln {
 namespace ohos {
@@ -15,6 +16,9 @@ public:
 
     virtual gfx::RendererBackend& getRendererBackend() = 0;
     virtual void setSize(Size) = 0;
+    virtual std::uint64_t getLastSubmitDurationUs() const { return 0; }
+    virtual void requestSnapshot() { throw std::runtime_error("Snapshot unavailable for this backend"); }
+    virtual bool writeSnapshot(const std::string&) { return false; }
 
     virtual std::int32_t getGlesContextClientVersion() const { return 0; }
     virtual const std::string& getRendererDiagnostic() const { return emptyDiagnostic(); }

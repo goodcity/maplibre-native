@@ -1,4 +1,9 @@
+#include <GLES3/gl3.h>
+#include <mln/util/image.hpp>
+#include <fstream>
+#include <vector>
 #include "egl_window_backend.hpp"
+#include <chrono>
 
 #include "native_window_utils.hpp"
 
@@ -203,7 +208,7 @@ public:
     void bind() override {
         MLN_TRACE_FUNC();
 
-        backend.setFramebufferBinding(0);
+        backend.bindWindowFramebuffer();
         backend.setViewport(0, 0, backend.getSize());
     }
 
@@ -250,12 +255,13 @@ public:
     }
 
     static std::shared_ptr<const DisplayConfig> create() {
-        static std::weak_ptr<const DisplayConfig> instance;
-        auto shared = instance.lock();
-        if (!shared) {
-            instance = shared = std::make_shared<DisplayConfig>(Key{});
-        }
-        return shared;
+        // EGL_DEFAULT_DISPLAY is also used by the Flutter/ArkUI host.
+        // eglInitialize is not reference counted: terminating it when the last
+        // map closes invalidates the host's contexts and surfaces as well.
+        // Keep this one display connection for the process lifetime; individual
+        // map contexts, surfaces and FBOs still release in the backend destructor.
+        static const auto instance = std::make_shared<DisplayConfig>(Key{});
+        return instance;
     }
 
     EGLDisplay display = EGL_NO_DISPLAY;
@@ -289,6 +295,7 @@ EGLWindowBackend::EGLWindowBackend(OHNativeWindow* window_, Size size_)
                 displayConfig->display, window, windowConfig, eglContext, eglSurface, contextClientVersion)) {
             throw std::runtime_error(eglErrorMessage("eglCreateWindowSurface"));
         }
+        if (contextClientVersion < 3) throw std::runtime_error("Business map framebuffer requires OpenGL ES 3");
         logDiagnostic(formatEGLConfig(displayConfig->display, windowConfig, contextClientVersion));
     } catch (...) {
         if (eglSurface != EGL_NO_SURFACE) {
@@ -306,6 +313,11 @@ EGLWindowBackend::EGLWindowBackend(OHNativeWindow* window_, Size size_)
 }
 
 EGLWindowBackend::~EGLWindowBackend() {
+    if (eglContext != EGL_NO_CONTEXT && eglSurface != EGL_NO_SURFACE &&
+        eglMakeCurrent(displayConfig->display, eglSurface, eglSurface, eglContext)) {
+        releaseFramebuffer();
+    }
+
     MLN_TRACE_FUNC();
 
     if (eglContext != EGL_NO_CONTEXT && eglSurface != EGL_NO_SURFACE) {
@@ -352,9 +364,81 @@ void EGLWindowBackend::setSize(Size size_) {
 void EGLWindowBackend::swap() {
     MLN_TRACE_FUNC();
 
-    if (!eglSwapBuffers(displayConfig->display, eglSurface)) {
-        Log::Warning(Event::GraphicsBackend, eglErrorMessage("eglSwapBuffers"));
+    const auto size = getSize();
+    if (captureRequested) {
+        PremultipliedImage image(size);
+        std::vector<std::uint8_t> row(static_cast<std::size_t>(size.width) * 4);
+        glReadPixels(0, 0, size.width, size.height, GL_RGBA, GL_UNSIGNED_BYTE, image.data.get());
+        if (glGetError() != GL_NO_ERROR) throw std::runtime_error("Map snapshot framebuffer read failed");
+        const std::size_t stride = row.size();
+        for (std::uint32_t y = 0; y < size.height / 2; ++y) {
+            auto* top = image.data.get() + y * stride;
+            auto* bottom = image.data.get() + (size.height - 1 - y) * stride;
+            std::copy_n(top, stride, row.data());
+            std::copy_n(bottom, stride, top);
+            std::copy_n(row.data(), stride, bottom);
+        }
+        capturedPng = encodePNG(image);
+        captureRequested = false;
     }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBlitFramebuffer(0, 0, size.width, size.height, 0, 0, size.width, size.height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    if (glGetError() != GL_NO_ERROR) throw std::runtime_error("Map Surface framebuffer blit failed");
+    const auto submitStarted = std::chrono::steady_clock::now();
+    if (!eglSwapBuffers(displayConfig->display, eglSurface)) {
+        capturedPng.clear();
+        throw std::runtime_error(eglErrorMessage("eglSwapBuffers"));
+    }
+    lastSubmitDurationUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - submitStarted).count();
+}
+
+void EGLWindowBackend::releaseFramebuffer() {
+    if (framebuffer) glDeleteFramebuffers(1, &framebuffer);
+    if (colorBuffer) glDeleteRenderbuffers(1, &colorBuffer);
+    if (depthStencilBuffer) glDeleteRenderbuffers(1, &depthStencilBuffer);
+    framebuffer = colorBuffer = depthStencilBuffer = 0;
+    framebufferSize = {};
+}
+
+void EGLWindowBackend::bindWindowFramebuffer() {
+    const auto size = getSize();
+    if (framebufferSize != size) {
+        releaseFramebuffer();
+        glGenFramebuffers(1, &framebuffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+        glGenRenderbuffers(1, &colorBuffer);
+        glBindRenderbuffer(GL_RENDERBUFFER, colorBuffer);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, size.width, size.height);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, colorBuffer);
+        glGenRenderbuffers(1, &depthStencilBuffer);
+        glBindRenderbuffer(GL_RENDERBUFFER, depthStencilBuffer);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, size.width, size.height);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthStencilBuffer);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, depthStencilBuffer);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+            throw std::runtime_error("Map framebuffer is incomplete");
+        framebufferSize = size;
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    assumeFramebufferBinding(framebuffer);
+    setFramebufferBinding(framebuffer);
+}
+
+void EGLWindowBackend::requestSnapshot() {
+    capturedPng.clear();
+    captureRequested = true;
+}
+
+bool EGLWindowBackend::writeSnapshot(const std::string& path) {
+    if (capturedPng.empty()) return false;
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(capturedPng.data(), static_cast<std::streamsize>(capturedPng.size()));
+    if (!output) throw std::runtime_error("Could not write map snapshot");
+    capturedPng.clear();
+    return true;
 }
 
 void EGLWindowBackend::activate() {
@@ -386,8 +470,11 @@ gl::ProcAddress EGLWindowBackend::getExtensionFunctionPointer(const char* name) 
 void EGLWindowBackend::updateAssumedState() {
     MLN_TRACE_FUNC();
 
-    assumeFramebufferBinding(0);
-    assumeViewport(0, 0, getSize());
+    // The map renders into its own FBO. Keep the actual GL binding and the
+    // renderer state cache aligned before a new command encoder is created.
+    // The previous frame (or a resize) may have left a nonzero FBO bound.
+    bindWindowFramebuffer();
+    setViewport(0, 0, getSize());
 }
 
 } // namespace ohos

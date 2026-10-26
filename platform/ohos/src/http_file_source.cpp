@@ -1,4 +1,6 @@
 #include "http_user_agent.hpp"
+#include "http_response_body.hpp"
+#include "http_request_diagnostics.hpp"
 
 #include <mln/storage/http_file_source.hpp>
 #include <mln/storage/resource.hpp>
@@ -212,7 +214,8 @@ void applyCacheHeaders(Response& response, Http_Headers* headers) {
     }
 }
 
-Response makeResponse(const Resource& resource, Http_Response* httpResponse, uint32_t errCode) {
+Response makeResponse(const Resource& resource, Http_Response* httpResponse, uint32_t errCode,
+                      std::optional<std::string> body) {
     if (errCode != OH_HTTP_RESULT_OK) {
         return makeNetworkError(errCode);
     }
@@ -228,10 +231,13 @@ Response makeResponse(const Resource& resource, Http_Response* httpResponse, uin
 
     const int code = static_cast<int>(httpResponse->responseCode);
     if (code == 200 || code == 206) {
-        if (httpResponse->body.buffer && httpResponse->body.length > 0) {
-            response.data = std::make_shared<std::string>(httpResponse->body.buffer, httpResponse->body.length);
+        // Some net_http versions use strdup for body.buffer but report the
+        // binary length. Never read that pointer, including as a fallback.
+        if (body) {
+            response.data = std::make_shared<std::string>(std::move(*body));
         } else {
-            response.data = std::make_shared<std::string>();
+            response.error = std::make_unique<Response::Error>(
+                Response::Error::Reason::Connection, "OpenHarmony HTTP response body is incomplete or exceeds limit");
         }
     } else if (code == 204 || (code == 404 && resource.kind == Resource::Kind::Tile)) {
         response.noContent = true;
@@ -258,10 +264,13 @@ Response makeResponse(const Resource& resource, Http_Response* httpResponse, uin
 
 class SlotPool {
 public:
+    static std::array<uint64_t, 2> counts();
     static void enqueueOrStart(const std::shared_ptr<RequestState>& state);
     static void release(std::size_t token, const RequestState* state);
     static void handleResponse(std::size_t token, Http_Response* response, uint32_t errCode);
     static void handleCanceled(std::size_t token);
+    static void handleData(std::size_t token, const char* data, std::size_t length);
+    static Http_OnDataReceiveCallback dataCallback(std::size_t token);
     static Http_ResponseCallback responseCallback(std::size_t token);
     static Http_OnVoidCallback canceledCallback(std::size_t token);
 
@@ -291,6 +300,16 @@ void canceledThunk() {
     SlotPool::handleCanceled(Token);
 }
 
+template <std::size_t Token>
+void dataThunk(const char* data, std::size_t length) {
+    SlotPool::handleData(Token, data, length);
+}
+
+template <std::size_t... Tokens>
+constexpr auto makeDataCallbacks(std::index_sequence<Tokens...>) {
+    return std::array<Http_OnDataReceiveCallback, sizeof...(Tokens)>{&dataThunk<Tokens>...};
+}
+
 template <std::size_t... Tokens>
 constexpr auto makeResponseCallbacks(std::index_sequence<Tokens...>) {
     return std::array<Http_ResponseCallback, sizeof...(Tokens)>{&responseThunk<Tokens>...};
@@ -301,6 +320,7 @@ constexpr auto makeCanceledCallbacks(std::index_sequence<Tokens...>) {
     return std::array<Http_OnVoidCallback, sizeof...(Tokens)>{&canceledThunk<Tokens>...};
 }
 
+constexpr auto dataCallbacks = makeDataCallbacks(std::make_index_sequence<kCallbackTokens>{});
 constexpr auto responseCallbacks = makeResponseCallbacks(std::make_index_sequence<kCallbackTokens>{});
 constexpr auto canceledCallbacks = makeCanceledCallbacks(std::make_index_sequence<kCallbackTokens>{});
 
@@ -401,6 +421,7 @@ public:
         }
 
         Http_EventsHandler handler{};
+        handler.onDataReceive = SlotPool::dataCallback(*activeToken);
         handler.onCanceled = SlotPool::canceledCallback(*activeToken);
 
         {
@@ -457,6 +478,7 @@ public:
         {
             std::scoped_lock lock(mutex);
             canceled = true;
+            body.discard();
             callback = nullptr;
             if (finished) {
                 return;
@@ -500,8 +522,23 @@ public:
         }
     }
 
+    void receiveData(const char* data, std::size_t length) {
+        std::scoped_lock lock(mutex);
+        if (!canceled && !finished) {
+            body.append(data, length);
+        }
+    }
+
     void complete(Http_Response* httpResponse, uint32_t errCode) {
-        auto response = makeResponse(resource, httpResponse, errCode);
+        std::optional<std::string> received;
+        {
+            std::scoped_lock lock(mutex);
+            if (!canceled && !finished && errCode == OH_HTTP_RESULT_OK && httpResponse) {
+                received = body.take(httpResponse->body.length);
+            }
+            body.discard();
+        }
+        auto response = makeResponse(resource, httpResponse, errCode, std::move(received));
         destroyResponse(httpResponse);
         finish(std::move(response));
     }
@@ -526,6 +563,7 @@ private:
     void cancelStartedRequest() {
         Http_Request* requestToDestroy = nullptr;
         Http_Headers* headersToDestroy = nullptr;
+        bool shouldWaitForNativeCallback = false;
         {
             std::scoped_lock lock(mutex);
             if (finished || awaitingNativeCallback) {
@@ -536,6 +574,7 @@ private:
             options.headers = nullptr;
             if (requestToDestroy) {
                 awaitingNativeCallback = true;
+                shouldWaitForNativeCallback = true;
             } else {
                 finished = true;
             }
@@ -547,7 +586,9 @@ private:
         if (headersToDestroy) {
             OH_Http_DestroyHeaders(&headersToDestroy);
         }
-        if (!requestToDestroy) {
+        // OH_Http_Destroy clears requestToDestroy. It does not imply that the
+        // native cancellation callback has arrived or that its slot is reusable.
+        if (!shouldWaitForNativeCallback) {
             const auto activeToken = getToken();
             if (activeToken) {
                 SlotPool::release(*activeToken, this);
@@ -569,6 +610,7 @@ private:
                 return;
             }
             finished = true;
+            body.discard();
             starting = false;
             requestToDestroy = std::exchange(request, nullptr);
             headersToDestroy = std::exchange(headers, nullptr);
@@ -621,6 +663,7 @@ private:
     mutable std::mutex mutex;
     std::shared_ptr<RequestState> self;
     std::optional<std::size_t> token;
+    ohos::HttpResponseBody body;
     Http_Request* request = nullptr;
     Http_Headers* headers = nullptr;
     Http_RequestOptions options{};
@@ -635,6 +678,15 @@ std::mutex SlotPool::mutex;
 std::array<SlotPool::Slot, kMaxActiveRequests> SlotPool::slots;
 std::deque<std::weak_ptr<RequestState>> SlotPool::pending;
 std::size_t SlotPool::nextSlot = 0;
+
+std::array<uint64_t, 2> SlotPool::counts() {
+    std::scoped_lock lock(mutex);
+    uint64_t active = 0;
+    uint64_t queued = 0;
+    for (const auto& slot : slots) active += !slot.state.expired();
+    for (const auto& state : pending) queued += !state.expired();
+    return {active, queued};
+}
 
 std::optional<std::size_t> SlotPool::assignSlotLocked(const std::shared_ptr<RequestState>& state) {
     for (std::size_t offset = 0; offset < slots.size(); ++offset) {
@@ -734,6 +786,16 @@ void SlotPool::handleResponse(std::size_t token, Http_Response* response, uint32
     state->complete(response, errCode);
 }
 
+void SlotPool::handleData(std::size_t token, const char* data, std::size_t length) {
+    if (auto state = stateForToken(token)) {
+        state->receiveData(data, length);
+    }
+}
+
+Http_OnDataReceiveCallback SlotPool::dataCallback(std::size_t token) {
+    return token < dataCallbacks.size() ? dataCallbacks[token] : nullptr;
+}
+
 void SlotPool::handleCanceled(std::size_t token) {
     auto state = stateForToken(token);
     if (!state) {
@@ -765,6 +827,12 @@ private:
 };
 
 } // namespace
+
+namespace ohos {
+std::array<uint64_t, 2> httpRequestCounts() {
+    return SlotPool::counts();
+}
+} // namespace ohos
 
 class HTTPFileSource::Impl {
 public:

@@ -231,7 +231,18 @@ void Context::enableDebugging() {
 UniqueShader Context::createShader(ShaderType type, const std::initializer_list<const char*>& sources) {
     UniqueShader result{MBGL_CHECK_ERROR(glCreateShader(static_cast<GLenum>(type))), {this}};
 
+#if defined(__OHOS__)
+    // The API20 emulator links multi-string shaders without their required UBOs.
+    // Submitting the same source bytes as one string renders correctly there.
+    std::string joinedSource;
+    for (const auto* source : sources) {
+        joinedSource += source;
+    }
+    const auto* source = joinedSource.c_str();
+    MBGL_CHECK_ERROR(glShaderSource(result, 1, &source, nullptr));
+#else
     MBGL_CHECK_ERROR(glShaderSource(result, static_cast<GLsizei>(sources.size()), sources.begin(), nullptr));
+#endif
     MBGL_CHECK_ERROR(glCompileShader(result));
 
     GLint status = 0;

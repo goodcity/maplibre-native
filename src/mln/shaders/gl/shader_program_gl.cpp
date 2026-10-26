@@ -8,6 +8,7 @@
 #include <mln/shaders/shader_manifest.hpp>
 
 #include <cstring>
+#include <stdexcept>
 #include <utility>
 
 namespace mln {
@@ -141,9 +142,15 @@ std::shared_ptr<ShaderProgramGL> ShaderProgramGL::create(
             programParameters.getProgramType(), gfx::Backend::Type::OpenGL, additionalDefines);
 
         for (const auto& blockInfo : uniformBlocksInfo) {
-            GLint index = MBGL_CHECK_ERROR(glGetUniformBlockIndex(program, blockInfo.name.data()));
+            const GLuint index = MBGL_CHECK_ERROR(glGetUniformBlockIndex(program, blockInfo.name.data()));
+            if (index == GL_INVALID_INDEX) {
+                throw std::runtime_error("Required uniform block is missing: " + std::string(blockInfo.name));
+            }
             GLint size = 0;
             MBGL_CHECK_ERROR(glGetActiveUniformBlockiv(program, index, GL_UNIFORM_BLOCK_DATA_SIZE, &size));
+            if (size <= 0) {
+                throw std::runtime_error("Required uniform block has invalid size: " + std::string(blockInfo.name));
+            }
             assert(size > 0);
             GLint binding = static_cast<GLint>(blockInfo.binding);
             MBGL_CHECK_ERROR(glUniformBlockBinding(program, index, binding));

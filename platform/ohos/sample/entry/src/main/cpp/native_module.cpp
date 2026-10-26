@@ -1,4 +1,7 @@
 #include "map_view.hpp"
+#include "http_request_diagnostics.hpp"
+#include "fence_diagnostic_linux.hpp"
+#include "fence_lifecycle_diagnostics.hpp"
 
 #include "gesture_handler.hpp"
 #include "native_values.hpp"
@@ -6,6 +9,12 @@
 #include <mln/storage/resource_options.hpp>
 #include <mln/util/logging.hpp>
 #include <mln/util/size.hpp>
+#include <mln/util/native_resource_diagnostics.hpp>
+
+#include <dirent.h>
+#include <unistd.h>
+#include <cstring>
+#include <cerrno>
 
 #include <algorithm>
 #include <cmath>
@@ -288,6 +297,7 @@ public:
         }
 
         closed = true;
+        fence_diagnostics::recordPhase(fenceDiagnosticControllerId, fence_diagnostics::Phase::ControllerCloseEntered, true);
 
         if (frameCallbackRegistered && node != nullptr &&
             OH_ArkUI_XComponent_UnregisterOnFrameCallback(node) != ARKUI_ERROR_CODE_NO_ERROR) {
@@ -316,7 +326,9 @@ public:
         surfaceCallbackRegistered = false;
 
         unregisterController(node, holder, this);
+        const bool hadMapView = mapView != nullptr;
         clearMapState();
+        fence_diagnostics::recordPhase(fenceDiagnosticControllerId, fence_diagnostics::Phase::MapStateClearReturned, hadMapView);
 
         if (nodeAddedToContent && content != nullptr && node != nullptr &&
             OH_ArkUI_NodeContent_RemoveNode(content, node) != ARKUI_ERROR_CODE_NO_ERROR) {
@@ -335,11 +347,14 @@ public:
             holder = nullptr;
         }
 
+        bool nodeDisposeAttempted = false;
         if (ownsNode && node != nullptr) {
             if (auto* api = nativeNodeApi()) {
+                nodeDisposeAttempted = true;
                 api->disposeNode(node);
             }
         }
+        fence_diagnostics::recordPhase(fenceDiagnosticControllerId, fence_diagnostics::Phase::NodeDisposeReturned, nodeDisposeAttempted);
 
         node = nullptr;
     }
@@ -412,6 +427,11 @@ public:
         if (!closed && renderingEnabled && surfaceVisible && mapView) {
             mapView->renderFrame();
         }
+    }
+
+    std::string execute(const std::string& input) {
+        if (closed) throw std::runtime_error("Map is disposed");
+        return ensureMapView().execute(input);
     }
 
     void reduceMemoryUse() {
@@ -579,6 +599,7 @@ public:
         const bool styleLoaded = mapView && mapView->hasLoadedStyle();
         const bool mapLoaded = mapView && mapView->hasLoadedMap();
         const bool fullyLoaded = mapView && mapView->isFullyLoaded();
+        const auto loadingState = mapView ? mapView->getLoadingState() : mln::ohos::MapView::LoadingState{};
         std::string backendLabel;
         if (mapView && mapView->getGlesContextClientVersion() > 0) {
             backendLabel = std::string{"OpenGL ES "} + std::to_string(mapView->getGlesContextClientVersion());
@@ -588,6 +609,11 @@ public:
 
         napi_value object = nullptr;
         napi_create_object(env, &object);
+        setSizeProperty(env, object, "submittedRevision", mapView ? mapView->getSubmittedRevision() : 0);
+        setSizeProperty(env, object, "renderedRevision", mapView ? mapView->getRenderedRevision() : 0);
+        setSizeProperty(env, object, "lastRenderDurationUs", mapView ? mapView->getLastRenderDurationUs() : 0);
+        setSizeProperty(env, object, "lastSubmitDurationUs", mapView ? mapView->getLastSubmitDurationUs() : 0);
+        setSizeProperty(env, object, "renderedFrames", mapView ? mapView->getRenderedFrameCount() : 0);
         setSizeProperty(env, object, "width", width);
         setSizeProperty(env, object, "height", height);
         setBoolProperty(env, object, "hasWindow", hasWindow);
@@ -597,6 +623,17 @@ public:
         setBoolProperty(env, object, "styleLoaded", styleLoaded);
         setBoolProperty(env, object, "mapLoaded", mapLoaded);
         setBoolProperty(env, object, "fullyLoaded", fullyLoaded);
+        setBoolProperty(env, object, "styleJsonLoaded", loadingState.styleJsonLoaded);
+        setBoolProperty(env, object, "styleResourcesLoaded", loadingState.styleResourcesLoaded);
+        setBoolProperty(env, object, "spritesLoaded", loadingState.spritesLoaded);
+        setSizeProperty(env, object, "sourceCount", loadingState.sourceCount);
+        setSizeProperty(env, object, "unloadedSourceCount", loadingState.unloadedSourceCount);
+        setSizeProperty(env, object, "unloadedImageSourceCount", loadingState.unloadedImageSourceCount);
+        setSizeProperty(env, object, "unloadedGeoJsonSourceCount", loadingState.unloadedGeoJsonSourceCount);
+        setSizeProperty(env, object, "unloadedTileSourceCount", loadingState.unloadedTileSourceCount);
+        setBoolProperty(env, object, "hasRenderFrameStatus", loadingState.hasRenderFrameStatus);
+        setBoolProperty(env, object, "lastFrameWasFull", loadingState.lastFrameWasFull);
+        setBoolProperty(env, object, "lastFrameNeedsRepaint", loadingState.lastFrameNeedsRepaint);
         setDoubleProperty(env, object, "renderedFrameRate", renderedFrameRate);
         setDoubleProperty(env, object, "frameCallbackRate", frameCallbackRate);
         if (!backendLabel.empty()) {
@@ -875,6 +912,7 @@ private:
     bool ownsNode = false;
     bool nodeAddedToContent = false;
     bool closed = false;
+    const std::uint64_t fenceDiagnosticControllerId = fence_diagnostics::lifecycleRecorder().nextControllerId();
     std::uint64_t frameCallbackCount = 0;
     bool surfaceVisible = false;
     std::string lastSurfaceError;
@@ -889,6 +927,7 @@ private:
 
 using ControllerHandle = std::shared_ptr<SurfaceController>;
 
+napi_value executeBusiness(napi_env env, napi_callback_info info);
 napi_value destroy(napi_env env, napi_callback_info info);
 napi_value renderFrame(napi_env env, napi_callback_info info);
 napi_value reduceMemoryUse(napi_env env, napi_callback_info info);
@@ -934,6 +973,7 @@ void finalizeController(napi_env, void* data, void*) {
 
 const napi_property_descriptor* contextProperties(std::size_t& count) {
     static napi_property_descriptor properties[] = {
+        {"execute", nullptr, executeBusiness, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"destroy", nullptr, destroy, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getCameraOptions", nullptr, getCameraOptions, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getPixelRatio", nullptr, getPixelRatio, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -998,6 +1038,19 @@ napi_value createMap(napi_env env, napi_callback_info info) {
     } catch (const std::exception& exception) {
         return throwError(env, exception.what());
     }
+}
+
+napi_value executeBusiness(napi_env env, napi_callback_info info) {
+    std::size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_value thisArg = nullptr;
+    napi_get_cb_info(env, info, &argc, argv, &thisArg, nullptr);
+    std::string input;
+    if (argc != 1 || !getString(env, argv[0], input)) return throwError(env, "Expected map operation JSON");
+    auto controller = resolveController(env, thisArg);
+    if (!controller) return getUndefined(env);
+    try { return createStringValue(env, controller->execute(input)); }
+    catch (const std::exception& error) { return throwError(env, error.what()); }
 }
 
 napi_value destroy(napi_env env, napi_callback_info info) {
@@ -1335,8 +1388,182 @@ napi_value getCameraOptions(napi_env env, napi_callback_info info) {
     return createCameraOptionsObject(env, controller->getCameraOptions());
 }
 
+// Diagnostic only: counts match the existing probe, without exposing FD paths.
+napi_value sampleResources(napi_env env, napi_callback_info) {
+    int counts[] = {0, 0, 0, 0, 0};
+    {
+        std::scoped_lock lock(controllerRegistryMutex());
+        counts[0] = static_cast<int>(controllersByNode().size());
+    }
+    DIR* directory = opendir("/proc/self/fd");
+    if (directory) {
+        while (const auto* entry = readdir(directory)) {
+            if (entry->d_name[0] == '.') continue;
+            char target[512];
+            const std::string path = std::string("/proc/self/fd/") + entry->d_name;
+            const auto length = readlink(path.c_str(), target, sizeof(target) - 1);
+            if (length < 0) {
+                // Other threads can close a descriptor after readdir. A missing
+                // link is no longer an open resource; retain unexpected errors.
+                if (errno != ENOENT) ++counts[4];
+                continue;
+            }
+            ++counts[1];
+            target[length] = 0;
+            if (strncmp(target, "/dev/dri/", 9) == 0 || strcmp(target, "/dev/teleport_express") == 0 ||
+                strcmp(target, "/dev/hvgr0") == 0) ++counts[2];
+            if (strstr(target, "sync_file") || strstr(target, "fence") || strcmp(target, "/dev/express_sync") == 0) ++counts[3];
+        }
+        closedir(directory);
+    } else { counts[1] = -1; }
+    napi_value result;
+    napi_create_array_with_length(env, 5, &result);
+    for (uint32_t index = 0; index < 5; ++index) {
+        napi_value value;
+        napi_create_int32(env, counts[index], &value);
+        napi_set_element(env, result, index, value);
+    }
+    return result;
+}
+
+napi_value sampleHttpRequests(napi_env env, napi_callback_info) {
+    const auto counts = mln::ohos::httpRequestCounts();
+    napi_value result;
+    napi_create_array_with_length(env, counts.size(), &result);
+    for (uint32_t index = 0; index < counts.size(); ++index) {
+        napi_value value;
+        napi_create_double(env, static_cast<double>(counts[index]), &value);
+        napi_set_element(env, result, index, value);
+    }
+    return result;
+}
+
+napi_value sampleImageResources(napi_env env, napi_callback_info) {
+    const auto counts = mln::ohos::nativeImageResourceCounts();
+    constexpr std::array<const char*, 8> names = {"imageSourceImpls",
+                                                "renderImageSources",
+                                                "rasterBuckets",
+                                                "rendererImpls",
+                                                "decoderImageSources",
+                                                "decoderOptions",
+                                                "decoderPixelmaps",
+                                                "decoderImageInfos"};
+    static_assert(names.size() == static_cast<std::size_t>(mln::ohos::NativeImageResource::Count));
+    napi_value result;
+    napi_create_object(env, &result);
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        setSizeProperty(env, result, names[index], counts.live[index]);
+    }
+    setSizeProperty(env, result, "decoderReleaseFailures", counts.decoderReleaseFailures);
+    return result;
+}
+
+napi_value setFenceDiagnosticRecording(napi_env env, napi_callback_info info) {
+    std::size_t argc = 1;
+    napi_value argv[1] = {nullptr};
+    napi_valuetype type = napi_undefined;
+    if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc != 1 ||
+        napi_typeof(env, argv[0], &type) != napi_ok || type != napi_boolean) {
+        return throwError(env, "Expected diagnostic recording boolean");
+    }
+    bool enabled = false;
+    if (napi_get_value_bool(env, argv[0], &enabled) != napi_ok) {
+        return throwError(env, "Expected diagnostic recording boolean");
+    }
+    fence_diagnostics::lifecycleRecorder().setRecording(enabled);
+    return getUndefined(env);
+}
+
+// Independent opt-in diagnostics. Never changes the existing five-count sample.
+// This is a bounded scan interval, not a process-wide atomic snapshot or owner proof.
+napi_value sampleFenceResources(napi_env env, napi_callback_info) {
+    try {
+        const auto sample = fence_diagnostics::sample();
+        const auto lifecycle = fence_diagnostics::lifecycleRecorder().read();
+        constexpr std::uint64_t safeInteger = 9007199254740991ULL;
+        if (sample.beginNs / 1000 > safeInteger || sample.endNs / 1000 > safeInteger ||
+            sample.firstTimestamp / 1000 > safeInteger || sample.lastTimestamp / 1000 > safeInteger ||
+            lifecycle.epoch > safeInteger || lifecycle.overwritten > safeInteger || lifecycle.clockFailures > safeInteger) {
+            return throwError(env, "Fence diagnostic numeric range");
+        }
+        for (unsigned index = 0; index < lifecycle.count; ++index) {
+            const auto& event = lifecycle.events[index];
+            if (event.sequence > safeInteger || event.controllerId > safeInteger || event.timeUs > safeInteger) {
+                return throwError(env, "Fence diagnostic numeric range");
+            }
+        }
+        napi_value result = nullptr;
+        napi_create_object(env, &result);
+        setSizeProperty(env, result, "schema", 1);
+        setSizeProperty(env, result, "entries", sample.entries);
+        setSizeProperty(env, result, "syncCandidates", sample.syncCandidates);
+        setSizeProperty(env, result, "legacyCandidates", sample.legacyCandidates);
+        setSizeProperty(env, result, "confirmedSyncDescriptors", sample.confirmedSyncDescriptors);
+        setSizeProperty(env, result, "closed", sample.closed);
+        setSizeProperty(env, result, "linkErrors", sample.linkErrors);
+        setSizeProperty(env, result, "duplicateErrors", sample.duplicateErrors);
+        setSizeProperty(env, result, "changedAfterDuplicate", sample.changedAfterDuplicate);
+        setSizeProperty(env, result, "queryOk", sample.queryOk);
+        setSizeProperty(env, result, "unsupported", sample.unsupported);
+        setSizeProperty(env, result, "denied", sample.denied);
+        setSizeProperty(env, result, "queryErrors", sample.queryErrors);
+        setSizeProperty(env, result, "active", sample.active);
+        setSizeProperty(env, result, "signaled", sample.signaled);
+        setSizeProperty(env, result, "errorStatus", sample.errorStatus);
+        setSizeProperty(env, result, "invalidStatus", sample.invalidStatus);
+        setSizeProperty(env, result, "componentTotal", sample.componentTotal);
+        setSizeProperty(env, result, "componentReads", sample.componentReads);
+        setSizeProperty(env, result, "componentReadErrors", sample.componentReadErrors);
+        setSizeProperty(env, result, "componentTooLarge", sample.componentTooLarge);
+        setSizeProperty(env, result, "childActive", sample.childActive);
+        setSizeProperty(env, result, "childSignaled", sample.childSignaled);
+        setSizeProperty(env, result, "childError", sample.childError);
+        setSizeProperty(env, result, "childInvalid", sample.childInvalid);
+        setSizeProperty(env, result, "timestamps", sample.timestamps);
+        setBoolProperty(env, result, "directoryAvailable", sample.directoryAvailable);
+        setBoolProperty(env, result, "directoryComplete", sample.directoryComplete);
+        setSizeProperty(env, result, "beginUs", sample.beginNs / 1000);
+        setSizeProperty(env, result, "endUs", sample.endNs / 1000);
+        setSizeProperty(env, result, "firstTimestampUs", sample.firstTimestamp / 1000);
+        setSizeProperty(env, result, "lastTimestampUs", sample.lastTimestamp / 1000);
+        setBoolProperty(env, result, "clockAvailable", sample.beginNs != 0 && sample.endNs >= sample.beginNs);
+        setBoolProperty(env, result, "syncReadComplete", sample.directoryAvailable && sample.directoryComplete &&
+            sample.closed == 0 && sample.linkErrors == 0 && sample.duplicateErrors == 0 &&
+            sample.changedAfterDuplicate == 0 && sample.unsupported == 0 && sample.denied == 0 &&
+            sample.queryErrors == 0 && sample.componentReadErrors == 0 && sample.componentTooLarge == 0 &&
+            sample.invalidStatus == 0 && sample.childInvalid == 0 && sample.queryOk == sample.syncCandidates);
+        setBoolProperty(env, result, "lifecycleRecording", lifecycle.recording);
+        setSizeProperty(env, result, "lifecycleEpoch", lifecycle.epoch);
+        setSizeProperty(env, result, "lifecycleCapacity", fence_diagnostics::LifecycleSample::capacity);
+        setSizeProperty(env, result, "lifecycleOverwritten", lifecycle.overwritten);
+        setSizeProperty(env, result, "lifecycleClockFailures", lifecycle.clockFailures);
+        napi_value events = nullptr;
+        napi_create_array_with_length(env, lifecycle.count, &events);
+        for (unsigned index = 0; index < lifecycle.count; ++index) {
+            const auto& event = lifecycle.events[index];
+            napi_value value = nullptr;
+            napi_create_object(env, &value);
+            setSizeProperty(env, value, "sequence", event.sequence);
+            setSizeProperty(env, value, "controllerId", event.controllerId);
+            setSizeProperty(env, value, "timeUs", event.timeUs);
+            setSizeProperty(env, value, "phase", event.phase);
+            setBoolProperty(env, value, "operationAttempted", event.operationAttempted);
+            napi_set_element(env, events, index, value);
+        }
+        napi_set_named_property(env, result, "lifecycleEvents", events);
+        return result;
+    } catch (...) {
+        return throwError(env, "Fence diagnostics unavailable");
+    }
+}
+
 napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor properties[] = {
+        {"sampleFenceResources", nullptr, sampleFenceResources, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setFenceDiagnosticRecording", nullptr, setFenceDiagnosticRecording, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"sampleImageResources", nullptr, sampleImageResources, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"sampleHttpRequests", nullptr, sampleHttpRequests, nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"sampleResources", nullptr, sampleResources, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"createMap", nullptr, createMap, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
 

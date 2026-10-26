@@ -122,7 +122,7 @@ public:
     // but merely that we have exhausted all options to get this tile to a
     // renderable state. Some tiles may not be renderable, but complete, e.g.
     // when a raster tile couldn't be loaded, or parsing failed.
-    bool isComplete() const { return loaded && !pending; }
+    bool isComplete() const { return loaded && !pending && !pendingData; }
 
     // "holdForFade" is used to keep tiles in the render tree after they're no
     // longer ideal tiles in order to allow symbols to fade out
@@ -156,6 +156,8 @@ protected:
     bool triedOptional = false;
     bool renderable = false;
     bool pending = false;
+    // Data retrieval can precede parsing, while an older layout remains usable.
+    bool pendingData = false;
     bool loaded = false;
 
     TileObserver* observer = nullptr;

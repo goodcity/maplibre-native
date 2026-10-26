@@ -40,6 +40,7 @@ add_library(
     maplibre_native_ohos
     SHARED
         ${MLN_OHOS_WINDOW_BACKEND_SOURCE}
+        business_operations.cpp
         gesture_handler.cpp
         map_view.cpp
         native_module.cpp
@@ -71,6 +72,7 @@ target_include_directories(
     maplibre_native_ohos
     PRIVATE
         ${MAPLIBRE_NATIVE_ROOT}/src
+        ${MAPLIBRE_NATIVE_ROOT}/platform/ohos/src
 )
 
 target_link_libraries(

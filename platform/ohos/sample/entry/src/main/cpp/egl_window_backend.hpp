@@ -30,6 +30,10 @@ public:
     std::int32_t getGlesContextClientVersion() const override { return contextClientVersion; }
     void setSize(Size) override;
     void swap();
+    std::uint64_t getLastSubmitDurationUs() const override { return lastSubmitDurationUs; }
+    void bindWindowFramebuffer();
+    void requestSnapshot() override;
+    bool writeSnapshot(const std::string&) override;
 
 protected:
     void activate() override;
@@ -47,6 +51,14 @@ private:
     OHNativeWindow* window = nullptr;
     std::int32_t contextClientVersion = 0;
     std::string framebufferDiagnostic;
+    unsigned framebuffer = 0;
+    unsigned colorBuffer = 0;
+    unsigned depthStencilBuffer = 0;
+    Size framebufferSize;
+    bool captureRequested = false;
+    std::uint64_t lastSubmitDurationUs = 0;
+    std::string capturedPng;
+    void releaseFramebuffer();
 };
 
 } // namespace ohos

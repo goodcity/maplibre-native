@@ -8,6 +8,7 @@
 #include <mln/util/string.hpp>
 
 #include <cassert>
+#include <chrono>
 #include <exception>
 #include <utility>
 
@@ -35,6 +36,7 @@ void RendererFrontend::setObserver(RendererObserver& observer) {
 
 void RendererFrontend::update(std::shared_ptr<UpdateParameters> params) {
     updateParameters = std::move(params);
+    updateRevision = submittedRevision;
     needsRender = true;
 }
 
@@ -52,14 +54,25 @@ bool RendererFrontend::renderFrame() {
     needsRender = false;
     try {
         gfx::BackendScope guard{backend};
+        lastError.clear();
         auto params = updateParameters;
+        const auto revision = updateRevision;
+        const auto started = std::chrono::steady_clock::now();
         renderer->render(params);
+        lastRenderDurationUs = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        renderedRevision = revision;
         return true;
     } catch (...) {
         needsRender = true;
-        Log::Error(Event::Render, util::toString(std::current_exception()));
+        lastError = util::toString(std::current_exception());
+        Log::Error(Event::Render, lastError);
         return false;
     }
+}
+
+std::vector<Feature> RendererFrontend::queryFeatures(const ScreenCoordinate& point, const std::string& layer) const {
+    return renderer ? renderer->queryRenderedFeatures(point, RenderedQueryOptions({{layer}})) : std::vector<Feature>{};
 }
 
 bool RendererFrontend::hasPendingRender() const {

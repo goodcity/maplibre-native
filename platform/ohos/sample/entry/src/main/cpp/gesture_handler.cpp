@@ -162,7 +162,11 @@ bool handleTouchAction(GestureState& state,
             return false;
         }
 
-        const bool doubleTap = state.lastTapActive && now - state.lastTapTime <= MaxDoubleTapInterval &&
+        // The inter-tap window ends at the second down. Its press duration is
+        // validated separately above and must not consume that window.
+        const auto tapInterval = state.tapStartTime - state.lastTapTime;
+        const bool doubleTap = state.lastTapActive && tapInterval >= std::chrono::steady_clock::duration::zero() &&
+                               tapInterval <= MaxDoubleTapInterval &&
                                distanceBetween(tap.x, tap.y, state.lastTapX, state.lastTapY) <= MaxDoubleTapDistance;
         if (doubleTap) {
             state.lastTapActive = false;

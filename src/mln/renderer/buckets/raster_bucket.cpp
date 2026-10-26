@@ -1,20 +1,34 @@
 #include <mln/renderer/buckets/raster_bucket.hpp>
 #include <mln/renderer/layers/render_raster_layer.hpp>
 #include <mln/gfx/upload_pass.hpp>
+#if defined(OHOS_PLATFORM)
+#include <mln/util/native_resource_diagnostics.hpp>
+#endif
 
 namespace mln {
 
 using namespace style;
 
 RasterBucket::RasterBucket(PremultipliedImage&& image_)
-    : image(std::make_shared<PremultipliedImage>(std::move(image_))) {}
+    : image(std::make_shared<PremultipliedImage>(std::move(image_))) {
+#if defined(OHOS_PLATFORM)
+    ohos::retainNativeImageResource(ohos::NativeImageResource::RasterBucket);
+#endif
+}
 
 RasterBucket::RasterBucket(std::shared_ptr<PremultipliedImage> image_)
-    : image(std::move(image_)) {}
+    : image(std::move(image_)) {
+#if defined(OHOS_PLATFORM)
+    ohos::retainNativeImageResource(ohos::NativeImageResource::RasterBucket);
+#endif
+}
 
 RasterBucket::~RasterBucket() {
     clear();
     setImage({});
+#if defined(OHOS_PLATFORM)
+    ohos::releaseNativeImageResource(ohos::NativeImageResource::RasterBucket);
+#endif
 }
 
 void RasterBucket::upload([[maybe_unused]] gfx::UploadPass& uploadPass) {

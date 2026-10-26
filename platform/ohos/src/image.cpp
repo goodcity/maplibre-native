@@ -1,15 +1,46 @@
 #include <mln/util/image.hpp>
+#include <mln/util/native_resource_diagnostics.hpp>
 #include <mln/util/premultiply.hpp>
+#include <boost/crc.hpp>
 
 #include <multimedia/image_framework/image/image_source_native.h>
 #include <multimedia/image_framework/image/pixelmap_native.h>
 
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+namespace mln::ohos {
+namespace {
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(NativeImageResource::Count)> liveImageResources{};
+std::atomic<std::uint64_t> imageReleaseFailures{0};
+} // namespace
+
+void retainNativeImageResource(NativeImageResource resource) noexcept {
+    liveImageResources[static_cast<std::size_t>(resource)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void releaseNativeImageResource(NativeImageResource resource) noexcept {
+    liveImageResources[static_cast<std::size_t>(resource)].fetch_sub(1, std::memory_order_relaxed);
+}
+
+void recordNativeImageReleaseFailure() noexcept {
+    imageReleaseFailures.fetch_add(1, std::memory_order_relaxed);
+}
+
+NativeImageResourceCounts nativeImageResourceCounts() noexcept {
+    NativeImageResourceCounts result{};
+    for (std::size_t index = 0; index < result.live.size(); ++index) {
+        result.live[index] = liveImageResources[index].load(std::memory_order_relaxed);
+    }
+    result.decoderReleaseFailures = imageReleaseFailures.load(std::memory_order_relaxed);
+    return result;
+}
+} // namespace mln::ohos
 
 namespace mln {
 namespace {
@@ -155,7 +186,10 @@ std::string pixelmapDescription(
 struct ImageSourceDeleter {
     void operator()(OH_ImageSourceNative* source) const {
         if (source) {
-            OH_ImageSourceNative_Release(source);
+            if (OH_ImageSourceNative_Release(source) != IMAGE_SUCCESS) {
+                ohos::recordNativeImageReleaseFailure();
+            }
+            ohos::releaseNativeImageResource(ohos::NativeImageResource::DecoderImageSource);
         }
     }
 };
@@ -163,7 +197,10 @@ struct ImageSourceDeleter {
 struct DecodingOptionsDeleter {
     void operator()(OH_DecodingOptions* options) const {
         if (options) {
-            OH_DecodingOptions_Release(options);
+            if (OH_DecodingOptions_Release(options) != IMAGE_SUCCESS) {
+                ohos::recordNativeImageReleaseFailure();
+            }
+            ohos::releaseNativeImageResource(ohos::NativeImageResource::DecoderOptions);
         }
     }
 };
@@ -171,7 +208,10 @@ struct DecodingOptionsDeleter {
 struct PixelmapDeleter {
     void operator()(OH_PixelmapNative* pixelmap) const {
         if (pixelmap) {
-            OH_PixelmapNative_Release(pixelmap);
+            if (OH_PixelmapNative_Release(pixelmap) != IMAGE_SUCCESS) {
+                ohos::recordNativeImageReleaseFailure();
+            }
+            ohos::releaseNativeImageResource(ohos::NativeImageResource::DecoderPixelmap);
         }
     }
 };
@@ -179,7 +219,10 @@ struct PixelmapDeleter {
 struct PixelmapInfoDeleter {
     void operator()(OH_Pixelmap_ImageInfo* info) const {
         if (info) {
-            OH_PixelmapImageInfo_Release(info);
+            if (OH_PixelmapImageInfo_Release(info) != IMAGE_SUCCESS) {
+                ohos::recordNativeImageReleaseFailure();
+            }
+            ohos::releaseNativeImageResource(ohos::NativeImageResource::DecoderImageInfo);
         }
     }
 };
@@ -224,21 +267,46 @@ PremultipliedImage decodeImage(const std::string& string) {
     checkImageResult(OH_ImageSourceNative_CreateFromData(data.data(), data.size(), &sourceRaw),
                      "OH_ImageSourceNative_CreateFromData");
     ImageSourcePtr source(sourceRaw);
+    if (source) {
+        ohos::retainNativeImageResource(ohos::NativeImageResource::DecoderImageSource);
+    }
 
     OH_DecodingOptions* optionsRaw = nullptr;
     checkImageResult(OH_DecodingOptions_Create(&optionsRaw), "OH_DecodingOptions_Create");
     DecodingOptionsPtr options(optionsRaw);
+    if (options) {
+        ohos::retainNativeImageResource(ohos::NativeImageResource::DecoderOptions);
+    }
     checkImageResult(OH_DecodingOptions_SetPixelFormat(options.get(), PIXEL_FORMAT_RGBA_8888),
                      "OH_DecodingOptions_SetPixelFormat");
 
     OH_PixelmapNative* pixelmapRaw = nullptr;
-    checkImageResult(OH_ImageSourceNative_CreatePixelmap(source.get(), options.get(), &pixelmapRaw),
-                     "OH_ImageSourceNative_CreatePixelmap");
+    const auto decodeResult = OH_ImageSourceNative_CreatePixelmap(source.get(), options.get(), &pixelmapRaw);
+    if (decodeResult != IMAGE_SUCCESS) {
+        // Identify malformed HTTP payloads without logging pixels, URLs or
+        // server responses. The same metadata also applies to local images.
+        const bool png = string.size() >= 8 && string.compare(0, 8, "\x89PNG\r\n\x1a\n", 8) == 0;
+        const bool jpeg = string.size() >= 2 && static_cast<unsigned char>(string[0]) == 0xff &&
+                          static_cast<unsigned char>(string[1]) == 0xd8;
+        const auto format = png ? "png" : (jpeg ? "jpeg" : "other");
+        boost::crc_32_type checksum;
+        if (png) checksum.process_bytes(string.data(), string.size());
+        throw std::runtime_error("OH_ImageSourceNative_CreatePixelmap failed with " +
+                                 imageErrorCodeMessage(decodeResult) + "; input=" + format +
+                                 "; bytes=" + std::to_string(string.size()) +
+                                 "; pngCrc32=" + std::to_string(png ? checksum.checksum() : 0));
+    }
     PixelmapPtr pixelmap(pixelmapRaw);
+    if (pixelmap) {
+        ohos::retainNativeImageResource(ohos::NativeImageResource::DecoderPixelmap);
+    }
 
     OH_Pixelmap_ImageInfo* infoRaw = nullptr;
     checkImageResult(OH_PixelmapImageInfo_Create(&infoRaw), "OH_PixelmapImageInfo_Create");
     PixelmapInfoPtr info(infoRaw);
+    if (info) {
+        ohos::retainNativeImageResource(ohos::NativeImageResource::DecoderImageInfo);
+    }
     checkImageResult(OH_PixelmapNative_GetImageInfo(pixelmap.get(), info.get()), "OH_PixelmapNative_GetImageInfo");
 
     uint32_t width = 0;

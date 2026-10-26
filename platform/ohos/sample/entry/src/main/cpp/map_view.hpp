@@ -23,6 +23,20 @@ namespace ohos {
 
 class MapView final : public MapObserver {
 public:
+    struct LoadingState {
+        bool styleJsonLoaded = false;
+        bool styleResourcesLoaded = false;
+        bool spritesLoaded = false;
+        std::uint64_t sourceCount = 0;
+        std::uint64_t unloadedSourceCount = 0;
+        std::uint64_t unloadedImageSourceCount = 0;
+        std::uint64_t unloadedGeoJsonSourceCount = 0;
+        std::uint64_t unloadedTileSourceCount = 0;
+        bool hasRenderFrameStatus = false;
+        bool lastFrameWasFull = false;
+        bool lastFrameNeedsRepaint = false;
+    };
+
     explicit MapView(float pixelRatio = 1.0f);
     ~MapView() override;
 
@@ -32,6 +46,7 @@ public:
     void setSurface(OHNativeWindow*, Size);
     void clearSurface();
     bool renderFrame();
+    std::string execute(const std::string&);
     void reduceMemoryUse();
 
     void setStyleURL(const std::string&);
@@ -69,10 +84,15 @@ public:
     const ResourceOptions& getResourceOptions() const { return resourceOptions; }
     std::vector<std::string> getStyleAttributions() const;
     bool hasPendingRender() const;
+    std::uint64_t getSubmittedRevision() const { return frontend ? frontend->getSubmittedRevision() : 0; }
+    std::uint64_t getRenderedRevision() const { return frontend ? frontend->getRenderedRevision() : 0; }
+    std::uint64_t getLastRenderDurationUs() const { return frontend ? frontend->getLastRenderDurationUs() : 0; }
+    std::uint64_t getLastSubmitDurationUs() const { return backend ? backend->getLastSubmitDurationUs() : 0; }
     std::uint64_t getRenderedFrameCount() const { return renderedFrameCount; }
     bool hasLoadedStyle() const { return styleLoaded; }
     bool hasLoadedMap() const { return mapLoaded; }
     bool isFullyLoaded() const;
+    LoadingState getLoadingState() const;
     std::int32_t getGlesContextClientVersion() const;
     const std::string& getRendererDiagnostic() const;
     const std::string& getLastMapLoadError() const { return lastMapLoadError; }
@@ -93,6 +113,7 @@ private:
     void onDidFailLoadingMap(MapLoadError, const std::string&) override;
     void onDidFinishLoadingMap() override;
     void onDidFinishLoadingStyle() override;
+    void onDidFinishRenderingFrame(const RenderFrameStatus&) override;
     void onStyleImageMissing(const std::string&) override;
     void onGlyphsError(const FontStack&, const GlyphRange&, std::exception_ptr) override;
     void onSpriteError(const std::optional<style::Sprite>&, std::exception_ptr) override;
@@ -100,6 +121,9 @@ private:
 
     void resetRuntimeState();
 
+    bool zoomGesturesEnabled = true;
+    bool rotateGesturesEnabled = true;
+    bool tiltGesturesEnabled = true;
     float pixelRatio = 1.0f;
     OHNativeWindow* window = nullptr;
     Size surfaceSize;
@@ -114,6 +138,9 @@ private:
     bool tileCacheEnabled = true;
     bool styleLoaded = false;
     bool mapLoaded = false;
+    bool hasRenderFrameStatus = false;
+    bool lastFrameWasFull = false;
+    bool lastFrameNeedsRepaint = false;
     std::uint64_t renderedFrameCount = 0;
     std::string lastMapLoadError;
     std::string lastRenderError;

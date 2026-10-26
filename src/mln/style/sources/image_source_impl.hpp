@@ -14,6 +14,7 @@ namespace style {
 class ImageSource::Impl final : public Source::Impl {
 public:
     Impl(std::string id, std::array<LatLng, 4> coords);
+    Impl(const Impl& other);
     Impl(const Impl& other, std::array<LatLng, 4> coords);
     Impl(const Impl& rhs, PremultipliedImage&& image);
 

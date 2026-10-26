@@ -25,11 +25,15 @@ void GeoJSONTile::updateData(std::shared_ptr<style::GeoJSONData> data_, bool nee
     assert(data_);
     data = std::move(data_);
     if (needsRelayout) reset();
+    // Do not report the retained old geometry as a completed data update while
+    // GeoJSONVT is still extracting the new tile on its sequenced scheduler.
+    pendingData = true;
     data->getTile(
         id.canonical,
         [this, self = weakFactory.makeWeakPtr(), capturedData = data.get()](TileFeatures features) {
             // If the data has changed, a new request is being processed, ignore this one
             if (auto guard = self.lock(); self && data.get() == capturedData) {
+                pendingData = false;
                 setData(std::make_unique<GeoJSONTileData>(std::move(features)));
             }
         },

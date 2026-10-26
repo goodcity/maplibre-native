@@ -9,7 +9,13 @@
 #include <mln/math/angles.hpp>
 #include <mln/map/map_options.hpp>
 #include <mln/style/source.hpp>
+#include <mln/style/sources/geojson_source.hpp>
+#include <mln/style/sources/image_source.hpp>
+#include <mln/style/sources/raster_dem_source.hpp>
+#include <mln/style/sources/raster_source.hpp>
+#include <mln/style/sources/vector_source.hpp>
 #include <mln/style/style.hpp>
+#include <mln/style/style_impl.hpp>
 #include <mln/util/client_options.hpp>
 #include <mln/util/logging.hpp>
 #include <mln/util/run_loop.hpp>
@@ -89,6 +95,8 @@ bool MapView::renderFrame() {
             if (frontend->renderFrame()) {
                 ++renderedFrameCount;
                 rendered = true;
+            } else if (!frontend->getLastError().empty()) {
+                lastRenderError = frontend->getLastError();
             }
         }
     };
@@ -198,7 +206,7 @@ void MapView::moveBy(double x, double y, AnimationOptions animationOptions) {
 }
 
 void MapView::pitchBy(double deltaPitch) {
-    if (!map || !std::isfinite(deltaPitch)) {
+    if (!tiltGesturesEnabled || !map || !std::isfinite(deltaPitch)) {
         return;
     }
 
@@ -217,7 +225,7 @@ void MapView::pitchBy(double deltaPitch) {
 }
 
 void MapView::scaleBy(double scale, double anchorX, double anchorY) {
-    if (!map || !std::isfinite(scale) || scale <= 0.0) {
+    if (!zoomGesturesEnabled || !map || !std::isfinite(scale) || scale <= 0.0) {
         return;
     }
 
@@ -228,7 +236,7 @@ void MapView::scaleBy(double scale, double anchorX, double anchorY) {
 }
 
 void MapView::flyBy(double scale, double anchorX, double anchorY, AnimationOptions animationOptions) {
-    if (!map || !std::isfinite(scale) || scale <= 0.0 || !std::isfinite(anchorX) || !std::isfinite(anchorY)) {
+    if (!zoomGesturesEnabled || !map || !std::isfinite(scale) || scale <= 0.0 || !std::isfinite(anchorX) || !std::isfinite(anchorY)) {
         return;
     }
 
@@ -244,7 +252,7 @@ void MapView::flyBy(double scale, double anchorX, double anchorY, AnimationOptio
 }
 
 void MapView::rotateBy(double previousAngle, double currentAngle, double anchorX, double anchorY) {
-    if (!map || !std::isfinite(previousAngle) || !std::isfinite(currentAngle) || !std::isfinite(anchorX) ||
+    if (!rotateGesturesEnabled || !map || !std::isfinite(previousAngle) || !std::isfinite(currentAngle) || !std::isfinite(anchorX) ||
         !std::isfinite(anchorY)) {
         return;
     }
@@ -331,6 +339,39 @@ bool MapView::hasPendingRender() const {
 
 bool MapView::isFullyLoaded() const {
     return map && map->isFullyLoaded();
+}
+
+MapView::LoadingState MapView::getLoadingState() const {
+    LoadingState state;
+    state.hasRenderFrameStatus = hasRenderFrameStatus;
+    state.lastFrameWasFull = lastFrameWasFull;
+    state.lastFrameNeedsRepaint = lastFrameNeedsRepaint;
+    if (!map) {
+        return state;
+    }
+
+    const auto& currentStyle = map->getStyle();
+    // Style::isLoaded only covers fetching/parsing the JSON. The Impl also
+    // checks sprites and source descriptions, independently of renderer tiles.
+    state.styleJsonLoaded = currentStyle.isLoaded();
+    state.styleResourcesLoaded = currentStyle.impl->isLoaded();
+    state.spritesLoaded = currentStyle.impl->areSpritesLoaded();
+    for (const auto* source : currentStyle.getSources()) {
+        ++state.sourceCount;
+        if (source->loaded) {
+            continue;
+        }
+        ++state.unloadedSourceCount;
+        if (source->is<style::ImageSource>()) {
+            ++state.unloadedImageSourceCount;
+        } else if (source->is<style::GeoJSONSource>()) {
+            ++state.unloadedGeoJsonSourceCount;
+        } else if (source->is<style::VectorSource>() || source->is<style::RasterSource>() ||
+                   source->is<style::RasterDEMSource>()) {
+            ++state.unloadedTileSourceCount;
+        }
+    }
+    return state;
 }
 
 std::int32_t MapView::getGlesContextClientVersion() const {
@@ -543,6 +584,12 @@ void MapView::onStyleImageMissing(const std::string& id) {
     lastStyleImageMissing = id;
 }
 
+void MapView::onDidFinishRenderingFrame(const RenderFrameStatus& status) {
+    hasRenderFrameStatus = true;
+    lastFrameWasFull = status.mode == RenderMode::Full;
+    lastFrameNeedsRepaint = status.needsRepaint;
+}
+
 void MapView::onGlyphsError(const FontStack&, const GlyphRange&, std::exception_ptr error) {
     lastGlyphsError = util::toString(error);
 }
@@ -559,6 +606,9 @@ void MapView::onRenderError(std::exception_ptr error) {
 void MapView::resetRuntimeState() {
     styleLoaded = false;
     mapLoaded = false;
+    hasRenderFrameStatus = false;
+    lastFrameWasFull = false;
+    lastFrameNeedsRepaint = false;
     renderedFrameCount = 0;
     lastMapLoadError.clear();
     lastRenderError.clear();

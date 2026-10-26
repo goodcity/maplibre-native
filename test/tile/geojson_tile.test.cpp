@@ -73,7 +73,64 @@ private:
     TileFeatures features;
 };
 
+class DeferredGeoJSONData final : public GeoJSONData {
+public:
+    void getTile(const CanonicalTileID&, const std::function<void(TileFeatures)>& fn, bool) final {
+        reply = fn;
+    }
+
+    void complete() {
+        ASSERT_TRUE(reply);
+        auto callback = std::move(reply);
+        callback({});
+    }
+
+    Features getChildren(std::uint32_t) final { return {}; }
+    Features getLeaves(std::uint32_t, std::uint32_t, std::uint32_t) final { return {}; }
+    std::uint8_t getClusterExpansionZoom(std::uint32_t) final { return 0; }
+
+private:
+    std::function<void(TileFeatures)> reply;
+};
+
 } // namespace
+
+TEST(GeoJSONTile, DeferredUpdateIsIncompleteUntilLatestDataArrives) {
+    GeoJSONTileTest test;
+    auto parameters = test.tileParameters;
+    parameters.isUpdateSynchronous = true;
+    CircleLayer layer("circle", "source");
+    auto data = std::make_shared<FakeGeoJSONData>(GeoJSONData::TileFeatures{});
+    GeoJSONTile tile(OverscaledTileID(0, 0, 0), "source", parameters, data);
+    tile.setLayers({makeMutable<CircleLayerProperties>(staticImmutableCast<CircleLayer::Impl>(layer.baseImpl))},
+                   parameters.globalState);
+    ASSERT_TRUE(tile.isComplete());
+
+    auto previous = std::make_shared<DeferredGeoJSONData>();
+    auto latest = std::make_shared<DeferredGeoJSONData>();
+    tile.updateData(previous, false, false);
+    EXPECT_FALSE(tile.isComplete());
+    EXPECT_TRUE(tile.isRenderable());
+    tile.updateData(latest, false, false);
+    previous->complete();
+    EXPECT_FALSE(tile.isComplete());
+
+    // A style relayout of the retained old data must not complete the new data.
+    tile.setLayers({makeMutable<CircleLayerProperties>(staticImmutableCast<CircleLayer::Impl>(layer.baseImpl))},
+                   parameters.globalState);
+    EXPECT_FALSE(tile.isComplete());
+    latest->complete();
+    EXPECT_TRUE(tile.isComplete());
+}
+
+TEST(GeoJSONTile, DeferredCallbackAfterDestroyIsIgnored) {
+    GeoJSONTileTest test;
+    auto data = std::make_shared<DeferredGeoJSONData>();
+    auto tile = std::make_unique<GeoJSONTile>(OverscaledTileID(0, 0, 0), "source", test.tileParameters, data);
+    EXPECT_FALSE(tile->isComplete());
+    tile.reset();
+    data->complete();
+}
 
 TEST(GeoJSONTile, SynchronousUpdate) {
     GeoJSONTileTest test;
